@@ -1,0 +1,868 @@
+import numpy as np
+import scipy.io as sio
+import random
+import time
+import csv
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Conv2D, Flatten, LSTM, AveragePooling2D, Dropout, BatchNormalization, Conv1D, GlobalAveragePooling1D, GRU, SimpleRNN
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier
+
+class DataPreparation:
+
+    """ Extracts the data from .mat files and prepares it for use with ML models"""
+
+    def __init__(self, DB='DB1'):
+        """
+        Initialise instance of the DataPreparation class
+        
+        Parameters:
+        - DB (str): The database to be used. Default is 'DB1'
+        """
+        self.DB = DB  # Set the database attribute to the provided value
+        # Set the number of participants and exercises based on the selected database
+        if DB == 'DB1':
+            self.numParticipants = 27  # Set the number of participants for DB1
+            self.numEx1 = 12  # Set the number of exercises in group 1 for DB1
+            self.numEx2 = 17  # Set the number of exercises in group 2 for DB1
+
+    def loadData(self, fileName):
+        """
+        Load the data from a .mat file
+
+        Parameters:
+        - fileName (str): The name of the .mat file to be loaded
+
+        Returns:
+        - emg (np.ndarray): The EMG data
+        - stimulus (np.ndarray): The stimulus data
+        - restimulus (np.ndarray): The restimulus data
+        """
+        mat = sio.loadmat(fileName)  # Load the .mat file using SciPy's loadmat function
+        emg = mat['emg']  # Extract EMG data from the loaded .mat file
+        stimulus = mat['stimulus']  # Extract stimulus data from the loaded .mat file
+        restimulus = mat['restimulus']  # Extract restimulus data from the loaded .mat file
+        return emg, stimulus, restimulus  # Return the extracted data
+
+    def removeOutliers(self, emgT, stimulusT, restimulusT):
+        """
+        Remove outliers from the data
+
+        Parameters:
+        - emgT (np.ndarray): The EMG data
+        - stimulusT (np.ndarray): The stimulus data
+        - restimulusT (np.ndarray): The restimulus data
+
+        Returns:
+        - trimmedEMG (np.ndarray): The EMG data with outliers removed
+        - trimmedStimulus (np.ndarray): The stimulus data with outliers removed
+        """
+        # Initialise trimmedEMG and trimmedStimulus with the original data
+        trimmedEMG = emgT
+        trimmedStimulus = stimulusT
+        
+        # Create a mask where stimulusT is not equal to restimulusT
+        mask = np.where(stimulusT != restimulusT)
+        
+        # Remove rows from trimmedEMG and corresponding elements from trimmedStimulus based on the mask
+        trimmedEMG = np.delete(trimmedEMG, mask, axis=0)
+        trimmedStimulus = np.delete(trimmedStimulus, mask)
+        
+        return trimmedEMG, trimmedStimulus  # Return the trimmed EMG and stimulus data
+    
+    def compileData(self, exGrp):
+        """
+        Compile the data for all participants
+
+        Parameters:
+        - exGrp (int): The exercise group to be used. 1, 2, or 3
+
+        Returns:
+        - emg1 (np.ndarray): The EMG data for all participants
+        - stimulus1 (np.ndarray): The stimulus data for all participants
+        - subjID1 (np.ndarray): The subject ID for all participants
+        """
+        # Determine the number of participants based on the database used
+        if self.DB == 'DB1':
+            numParticipants = self.numParticipants
+
+        # Determine the exercise group abbreviation based on the input exGrp
+        if exGrp == 1:
+            grp = 'E1'
+        elif exGrp == 2:
+            grp = 'E2'
+        elif exGrp == 3:
+            grp = 'E3'
+
+        # Initialise variables to store the compiled data
+        emg1, stimulus1, subjID1 = None, None, None
+
+        # Iterate over each participant
+        for i in range(1, numParticipants + 1):
+            # Construct the file name for the participant's data
+            exFileName = f"{self.DB}/S{i}_A1_{grp}.mat"
+
+            # Load the data for the participant
+            emgTemp, stimulusTemp, restimTemp = self.loadData(exFileName)
+
+            # Remove outliers from the loaded data
+            emgTemp, stimulusTemp = self.removeOutliers(emgTemp, stimulusTemp, restimTemp)
+
+            # Convert the data to numpy arrays
+            emgTemp = np.array(emgTemp)
+            stimulusTemp = np.array(stimulusTemp)
+
+            # Store the data for the first participant
+            if i == 1:
+                emg1 = emgTemp
+                stimulus1 = stimulusTemp
+                subjID1 = [i] * len(stimulusTemp)
+            # Concatenate the data for subsequent participants
+            else:
+                emg1 = np.concatenate((emg1, emgTemp), axis=0)
+                stimulus1 = np.concatenate((stimulus1, stimulusTemp), axis=0)
+                subjID1 = np.concatenate((subjID1, [i] * len(stimulusTemp)), axis=0)
+
+        # Return the compiled data
+        return emg1, stimulus1, subjID1
+
+    def extractLabelledData(self, emgData, stimulusData, allSubjID):
+        """
+        Extract labelled data from the compiled data
+        
+        Parameters:
+        - emgData (np.ndarray): The compiled EMG data
+        - stimulusData (np.ndarray): The compiled stimulus data
+        - allSubjID (np.ndarray): The compiled subject IDs
+
+        Returns:
+        - labelledDataDict (dict): A dictionary containing the labelled data
+        - labelledSubjIDDict (dict): A dictionary containing the subject IDs corresponding to the labelled data
+        """
+        # Initialise dictionaries to store the labelled data and subject IDs
+        labelledDataDict = {}  # Dictionary to store labelled EMG data
+        labelledSubjIDDict = {}  # Dictionary to store corresponding subject IDs
+        currentLabel = None  # Variable to track the current label
+        regionStart = None  # Variable to store the start index of a labelled region
+
+        # Iterate over the stimulus data and extract labelled regions
+        for i, labelVal in enumerate(stimulusData):
+            if labelVal != currentLabel:
+                # If a new label is encountered, save the previous labelled region
+                if regionStart is not None:
+                    regionEnd = i  # End index of the labelled region
+                    # Store the labelled EMG data and corresponding subject IDs
+                    labelledDataDict[int(currentLabel)] = labelledDataDict.get(int(currentLabel), []) + [emgData[regionStart:regionEnd, :]]
+                    labelledSubjIDDict[int(currentLabel)] = labelledSubjIDDict.get(int(currentLabel), []) + [allSubjID[regionStart:regionEnd]]
+                
+                # Update the current label and start index of the new region
+                currentLabel = labelVal
+                regionStart = i
+                
+                # Initialise empty lists for the new label if not already present in dictionaries
+                if int(currentLabel) not in labelledDataDict:
+                    labelledDataDict[int(currentLabel)] = []
+                    labelledSubjIDDict[int(currentLabel)] = []
+
+        # Add the last labelled region
+        regionEnd = len(stimulusData)
+        labelledDataDict[int(currentLabel)] = labelledDataDict.get(int(currentLabel), []) + [emgData[regionStart:regionEnd, :]]
+        labelledSubjIDDict[int(currentLabel)] = labelledSubjIDDict.get(int(currentLabel), []) + [allSubjID[regionStart:regionEnd]]
+
+        # Trim the number of zeroes to be the same as the number of ones
+        dataZeros = labelledDataDict.pop(0)  # Extract labelled EMG data with label 0 (zeroes)
+        subjIDZeros = labelledSubjIDDict.pop(0)  # Extract corresponding subject IDs with label 0 (zeroes)
+        numZeros = len(labelledDataDict.get(1, []))  # Count of labelled regions with label 1 (ones)
+        # Randomly select indices to be trimmed from labelled zeroes to match the number of labelled ones
+        trimmedIndices = random.sample(range(len(dataZeros)), k=len(dataZeros) - numZeros)
+        # Extract trimmed labelled zeroes and corresponding subject IDs
+        trimmedZeros = [dataZeros[i] for i in range(len(dataZeros)) if i not in trimmedIndices]
+        trimmedSubjIDZeros = [subjIDZeros[i] for i in range(len(subjIDZeros)) if i not in trimmedIndices]
+        # Update dictionaries with trimmed labelled zeroes and corresponding subject IDs
+        labelledDataDict[0] = trimmedZeros
+        labelledSubjIDDict[0] = trimmedSubjIDZeros
+
+        # Return the dictionaries containing labelled EMG data and subject IDs
+        return labelledDataDict, labelledSubjIDDict
+
+
+    def testTrainSplit(self, dataDict, subjIDDict, trainingSplit=0.8, validationSplit=0.1):
+        """
+        Split the data into training, validation, and testing sets
+
+        Parameters:
+        - dataDict (dict): A dictionary containing the labelled data
+        - subjIDDict (dict): A dictionary containing the subject IDs corresponding to the labelled data
+        - trainingSplit (float): The proportion of data to be used for training. Default is 0.8
+        - validationSplit (float): The proportion of data to be used for validation. Default is 0.1
+
+        Returns:
+        - trainDataDict (dict): A dictionary containing the training data
+        - validDataDict (dict): A dictionary containing the validation data
+        - testDataDict (dict): A dictionary containing the testing data
+        - trainSubjIDDict (dict): A dictionary containing the subject IDs corresponding to the training data
+        - validSubjIDDict (dict): A dictionary containing the subject IDs corresponding to the validation data
+        - testSubjIDDict (dict): A dictionary containing the subject IDs corresponding to the testing data
+        """
+        # Initialise dictionaries to store the training, validation, and testing data
+        trainDataDict = {}  # Dictionary for training data
+        validDataDict = {}  # Dictionary for validation data
+        testDataDict = {}   # Dictionary for testing data
+        trainSubjIDDict = {}  # Dictionary for subject IDs corresponding to training data
+        validSubjIDDict = {}  # Dictionary for subject IDs corresponding to validation data
+        testSubjIDDict = {}   # Dictionary for subject IDs corresponding to testing data
+
+        # Iterate over labels in the input data dictionary
+        for label in dataDict.keys():
+            data = dataDict[label]  # Extract EMG data for the current label
+            subjID = subjIDDict[label]  # Extract subject IDs for the current label
+
+            # Shuffle indices for random data splitting
+            random.seed(10)  # Set random seed for reproducibility
+            indices = np.random.permutation(len(data))  # Generate random permutation of indices
+
+            # Calculate the number of data samples for each split
+            numTrain = int(len(data) * trainingSplit)  # Number of samples for training
+            numValid = int(len(data) * validationSplit)  # Number of samples for validation
+
+            # Split indices into training, validation, and testing sets
+            trainIndices = indices[:numTrain]  # Indices for training data
+            validIndices = indices[numTrain:numTrain + numValid]  # Indices for validation data
+            testIndices = indices[numTrain + numValid:]  # Indices for testing data
+
+            # Extract data samples and subject IDs based on the split indices and store them in dictionaries
+            trainDataDict[label] = [data[i] for i in trainIndices]  # Training data for the current label
+            validDataDict[label] = [data[i] for i in validIndices]  # Validation data for the current label
+            testDataDict[label] = [data[i] for i in testIndices]    # Testing data for the current label
+            trainSubjIDDict[label] = [subjID[i] for i in trainIndices]  # Subject IDs for training data
+            validSubjIDDict[label] = [subjID[i] for i in validIndices]  # Subject IDs for validation data
+            testSubjIDDict[label] = [subjID[i] for i in testIndices]    # Subject IDs for testing data
+
+        # Return dictionaries containing training, validation, and testing data along with corresponding subject IDs
+        return trainDataDict, validDataDict, testDataDict, trainSubjIDDict, validSubjIDDict, testSubjIDDict
+
+    def trainingWindows(self, trainDict, subjID, windowSize):
+        """
+        Extract training windows from the labelled data
+        
+        Parameters:
+        - trainDict (dict): A dictionary containing the training data
+        - subjID (dict): A dictionary containing the subject IDs corresponding to the training data
+        - windowSize (int): The size of the window to be extracted
+        
+        Returns:
+        - trainWindows (dict): A dictionary containing the training windows
+        - subjIDWindows (dict): A dictionary containing the subject IDs corresponding to the training windows
+        """
+        # Initialise dictionaries to store training windows and corresponding subject IDs
+        trainWindows = {}   # Dictionary for training windows
+        subjIDWindows = {}  # Dictionary for subject IDs corresponding to training windows
+
+        # Iterate over labels in the training data dictionary
+        for label in trainDict.keys():
+            data = trainDict[label]  # Extract training data for the current label
+            ids = subjID[label]      # Extract subject IDs for the current label
+
+            windows = []          # List to store training windows
+            subjIDBlocks = []    # List to store subject IDs corresponding to each window
+
+            # Iterate over each data block for the current label
+            for i in range(len(data)):
+                labelBlock = data[i]    # Extract a block of data samples
+                subjIDBlock = ids[i]    # Extract corresponding subject IDs for the block
+
+                # Iterate over the block of data to create overlapping windows
+                for j in range(0, len(labelBlock) - windowSize, int(0.5 * windowSize)):
+                    windows.append(labelBlock[j:j+windowSize])  # Extract a window of data and append to the list
+                    subjIDBlocks.append(np.unique(subjIDBlock[j:j+windowSize]))  # Extract corresponding subject IDs and append to the list
+
+            trainWindows[label] = windows      # Store windows for the current label
+            subjIDWindows[label] = subjIDBlocks  # Store subject IDs for the windows of the current label
+
+        # Return dictionaries containing training windows and corresponding subject IDs
+        return trainWindows, subjIDWindows
+
+
+    def testWindows(self, testDict, subjID, windowSize):
+        """
+        Extract test windows from the labelled data
+
+        Parameters:
+        - testDict (dict): A dictionary containing the testing data
+        - subjID (dict): A dictionary containing the subject IDs corresponding to the testing data
+        - windowSize (int): The size of the window to be extracted
+
+        Returns:
+        - testWindows (dict): A dictionary containing the test windows
+        - testSubjIDWindows (dict): A dictionary containing the subject IDs corresponding to the test windows
+        """
+        testWindows = {}
+        testSubjIDWindows = {}
+
+        for label in testDict.keys():
+            data = testDict[label]
+            ids = subjID[label]
+
+            windows = []
+            subjIDBlocks = []  # To store subject IDs corresponding to each window
+            for i in range(len(data)):
+                labelBlock = data[i]
+                subjIDBlock = ids[i]
+                for j in range(0, len(labelBlock) - windowSize, int(0.5 * windowSize)):
+                    windows.append(labelBlock[j:j+windowSize])
+                    subjIDBlocks.append(np.unique(subjIDBlock[j:j+windowSize]))  # Extract corresponding subject IDs
+
+            testWindows[label] = windows
+            testSubjIDWindows[label] = subjIDBlocks
+
+        return testWindows, testSubjIDWindows
+
+    def validationWindows(self, validDict, subjID, windowSize):
+        """
+        Extract validation windows from the labelled data
+        
+        Parameters:
+        - validDict (dict): A dictionary containing the validation data
+        - subjID (dict): A dictionary containing the subject IDs corresponding to the validation data
+        - windowSize (int): The size of the window to be extracted
+        
+        Returns:
+        - validWindows (dict): A dictionary containing the validation windows
+        - validSubjIDWindows (dict): A dictionary containing the subject IDs corresponding to the validation windows
+        """
+        validWindows = {}
+        validSubjIDWindows = {}
+
+        for label in validDict.keys():
+            data = validDict[label]
+            ids = subjID[label]
+
+            windows = []
+            subjIDBlocks = []  # To store subject IDs corresponding to each window
+            for i in range(len(data)):
+                labelBlock = data[i]
+                subjIDBlock = ids[i]
+                for j in range(0, len(labelBlock) - windowSize, int(0.5 * windowSize)):
+                    windows.append(labelBlock[j:j+windowSize])
+                    subjIDBlocks.append(np.unique(subjIDBlock[j:j+windowSize]))  # Extract corresponding subject IDs
+
+            validWindows[label] = windows
+            validSubjIDWindows[label] = subjIDBlocks
+
+        return validWindows, validSubjIDWindows
+
+
+class FeatureExtract():
+    
+    """ Extracts features from the EMG data"""
+
+    def __init__(self):
+        """
+        Initialise instance of the FeatureExtract class
+        """
+        pass
+
+    def extractMean(self, windowData):
+        """
+        Extract the mean of the window data
+        
+        Parameters:
+        - windowData (np.ndarray): The window data
+        
+        Returns:
+        - mean (np.ndarray): The mean of the window data
+        """
+        return np.mean(windowData, axis=0)
+
+    def extractVariance(self, windowData):
+        """
+        Extract the variance of the window data
+        
+        Parameters:
+        - windowData (np.ndarray): The window data
+
+        Returns:
+        - variance (np.ndarray): The variance of the window data
+        """
+        return np.var(windowData, axis=0)
+
+    def extractRMS(self, windowData):
+        """
+        Extract the root mean square of the window data
+
+        Parameters:
+        - windowData (np.ndarray): The window data
+
+        Returns:
+        - rms (np.ndarray): The root mean square of the window data
+        """
+        return np.sqrt(np.mean(windowData**2, axis=0))
+
+    def extractMAV(self, windowData):
+        """
+        Extract the mean absolute value of the window data
+
+        Parameters:
+        - windowData (np.ndarray): The window data
+
+        Returns:
+        - mav (np.ndarray): The mean absolute value of the window data
+        """
+        return np.mean(np.abs(windowData), axis=0)
+
+    def extractWL(self, windowData):
+        """
+        Extract the waveform length of the window data
+
+        Parameters:
+        - windowData (np.ndarray): The window data
+
+        Returns:
+        - wl (np.ndarray): The waveform length of the window data
+        """
+        return np.sum(np.abs(np.diff(windowData, axis=0)), axis=0)
+
+    def extractSSI(self, windowData):
+        """
+        Extract the simple square integral of the window data
+        
+        Parameters:
+        - windowData (np.ndarray): The window data
+
+        Returns:
+        - ssi (np.ndarray): The simple square integral of the window data
+        """
+        return np.sum(windowData**2, axis=0)
+
+    def extractMeanFreq(self, windowData, samplingRate=100):
+        """
+        Extract the mean frequency of the window data
+
+        Parameters:
+        - windowData (np.ndarray): The window data
+        - samplingRate (int): The sampling rate of the data. Default is 100
+
+        Returns:
+        - meanFreq (np.ndarray): The mean frequency of the window data
+        """
+        fftRes = np.fft.fft(windowData, axis=0)
+        ampSpec = np.abs(fftRes)
+        freqs = np.fft.fftfreq(windowData.shape[0], 1 / samplingRate)  # Specify the sampling rate
+        meanFreq = np.sum(ampSpec * freqs[:, np.newaxis], axis=0) / np.sum(ampSpec, axis=0)
+        return meanFreq
+
+    def extractFeatures(self, windowData):
+        """
+        Extract all features from the window data
+
+        Parameters:
+        - windowData (np.ndarray): The window data
+
+        Returns:
+        - features (np.ndarray): The extracted features
+        """
+        mean = self.extractMean(windowData).T
+        variance = self.extractVariance(windowData).T
+        rms = self.extractRMS(windowData).T
+        mav = self.extractMAV(windowData).T
+        wl = self.extractWL(windowData).T
+        ssi = self.extractSSI(windowData).T
+        meanFreq = self.extractMeanFreq(windowData).T
+        return np.vstack((mean, variance, rms, mav, wl, ssi, meanFreq))
+
+    def extractAllFeatures(self, windowDataDict):
+        """
+        Extract all features from the window data dictionary
+        
+        Parameters:
+        - windowDataDict (dict): A dictionary containing the window data
+        
+        Returns:
+        - featureDict (dict): A dictionary containing the extracted features
+        """
+        featureDict = {}
+        for label in windowDataDict.keys():
+            featureDict[label] = []
+            for window in windowDataDict[label]:
+                features = self.extractFeatures(window)
+                featureDict[label].append(features)
+        return featureDict
+
+    def standardiseFeatures(self, featureDict):
+        """
+        Standardise the extracted features
+
+        Parameters:
+        - featureDict (dict): A dictionary containing the extracted features
+
+        Returns:
+        - featureDict (dict): A dictionary containing the standardised features
+        """
+        for label in featureDict.keys():
+            featureDict[label] = (featureDict[label] - np.mean(featureDict[label], axis=0)) / np.std(featureDict[label], axis=0)
+        return featureDict
+
+
+
+
+# Prepare the data
+dataPrep = DataPreparation()
+allEMG, allStim, allSubjID = dataPrep.compileData(1)
+labelledData, labelledSubjID = dataPrep.extractLabelledData(allEMG, allStim, allSubjID)
+trainData, validData, testData, trainSubjID, validSubjID, testSubjID = dataPrep.testTrainSplit(labelledData, labelledSubjID, trainingSplit=0.8, validationSplit=0.1)
+trainWindows, trainSubjWind = dataPrep.trainingWindows(trainData, trainSubjID, windowSize=30)
+testWindows, testSubjWind = dataPrep.testWindows(testData, testSubjID, windowSize=30)
+validWindows, validSubjWind = dataPrep.validationWindows(validData, validSubjID, windowSize=30)
+
+# Initialize FeatureExtract instance
+featExt = FeatureExtract()
+
+# Extract features from training and testing windows
+trainFeatures = featExt.extractAllFeatures(trainWindows)
+testFeatures = featExt.extractAllFeatures(testWindows)
+
+# Standardize the features
+trainFeaturesStandardised = featExt.standardiseFeatures(trainFeatures)
+testFeaturesStandardised = featExt.standardiseFeatures(testFeatures)
+
+# Function to convert dictionary to list
+def dictToList(dict):
+    data = []
+    labels = []
+    for lab, wind in dict.items():
+        for window in wind:
+            data.append(window)
+            labels.append(lab)
+    return data, labels
+
+# Convert dictionaries to lists
+finalTrainData, finalTrainLabels = dictToList(trainWindows)
+finalTestData, finalTestLabels = dictToList(testWindows)
+trainSubjID, _ = dictToList(trainSubjWind)
+testSubjID, _ = dictToList(testSubjWind)
+finalValidData, finalValidLabels = dictToList(validWindows)
+validSubjID, _ = dictToList(validSubjWind)
+
+
+def testBench(trainData, trainLabel, testData, testLabel, validData, validLabel, groupData, algorithm):
+    if algorithm == "KNN":
+
+        trainData = np.array([window.flatten() for window in trainData])
+        testData = np.array([window.flatten() for window in testData])
+        trainLabel = np.array(trainLabel)
+        testLabel = np.array(testLabel)
+
+        st = time.time()
+        knn = KNeighborsClassifier(n_neighbors=3)
+        print('Training KNN....')
+        knn.fit(trainData, trainLabel)
+        trainTime = time.time() - st
+        print('Training Complete')
+        st2 = time.time()
+        print('Predicting Labels....')
+        predictions = knn.predict(testData)
+        classificationTime = time.time() - st2
+        classTimePerTest = classificationTime / len(testLabel)
+        print('Predictions Complete')
+
+    elif algorithm == "SVM":
+
+        trainData = np.array([window.flatten() for window in trainData])
+        testData = np.array([window.flatten() for window in testData])
+        trainLabel = np.array(trainLabel)
+        testLabel = np.array(testLabel)
+
+        st = time.time()
+        svc = SVC(kernel="rbf", C=1.0, gamma='scale', random_state=42)
+        print('Training SVM....')
+        svc.fit(trainData, trainLabel)
+        print('Training Complete')
+        trainTime = time.time() - st
+        st2 = time.time()
+        print('Predicting Labels....')
+        predictions = svc.predict(testData)
+        classificationTime = time.time() - st2
+        classTimePerTest = classificationTime / len(testLabel)
+        print('Predictions Complete')
+
+    elif algorithm == "CNN":
+
+        trainData = np.array(trainData).reshape(-1, 30, 10, 1)
+        testData = np.array(testData).reshape(-1, 30, 10, 1)
+        validData = np.array(validData).reshape(-1, 30, 10, 1)
+
+        trainLabel = np.array(trainLabel)
+        testLabel = np.array(testLabel)
+        validLabel = np.array(validLabel)
+
+        model = Sequential()
+        model.add(Conv2D(32, kernel_size=(1,10), activation='relu', input_shape=(30, 10, 1), padding='same'))
+        model.add(BatchNormalization())
+
+        model.add(Conv2D(32, kernel_size=3, activation='relu', padding='same'))
+        model.add(BatchNormalization())
+        model.add(AveragePooling2D(pool_size=(3,3)))
+
+        model.add(Conv2D(64, kernel_size=(5,1), activation='relu', padding='same'))
+        model.add(BatchNormalization())
+
+        model.add(Conv2D(64, kernel_size=(1,1), activation='relu'))
+
+        model.add(Flatten())
+        model.add(Dense(128, activation='relu'))
+        model.add(Dropout(0.5))
+        model.add(Dense(13, activation='softmax'))
+
+        st = time.time()
+        model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+        print("CNN training....")
+        history = model.fit(trainData, trainLabel, validation_data=(validData, validLabel), epochs=100, batch_size=32)
+        print("CNN training complete")
+        trainTime = time.time() - st
+        st2 = time.time()
+        print("CNN classifying....")
+        probs = model.predict(testData)
+        print("CNN classifying complete")
+        classificationTime = time.time() - st2
+        classTimePerTest = classificationTime/ len(testLabel)
+        predictions = np.argmax(probs, axis=1)
+
+    elif algorithm == "RNN":
+        trainData = np.array(trainData).reshape(-1, 30, 10, 1)
+        testData = np.array(testData).reshape(-1, 30, 10, 1)
+        validData = np.array(validData).reshape(-1, 30, 10, 1)
+
+        trainLabel = np.array(trainLabel)
+        testLabel = np.array(testLabel)
+        validLabel = np.array(validLabel)
+
+        model = Sequential()
+
+        model.add(SimpleRNN(units=50, activation='relu', input_shape=(30, 10)))
+        model.add(BatchNormalization())
+        model.add(Dense(13, activation='softmax'))
+
+        st = time.time()
+        model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+        print("RNN training....")
+        history = model.fit(trainData, trainLabel, validation_data=(validData, validLabel), epochs=100, batch_size=32)
+        print("RNN training complete")
+        trainTime = time.time() - st
+        st2 = time.time()
+        print("RNN classifying....")
+        probs = model.predict(testData)
+        print("RNN classifying complete")
+        classificationTime = time.time() - st2
+        classTimePerTest = classificationTime/ len(testLabel)
+        predictions = np.argmax(probs, axis=1)
+
+    elif algorithm == "TCN":
+
+        trainData = np.array(trainData).reshape(-1, 30, 10, 1)
+        testData = np.array(testData).reshape(-1, 30, 10, 1)
+        validData = np.array(validData).reshape(-1, 30, 10, 1)
+
+        trainLabel = np.array(trainLabel)
+        testLabel = np.array(testLabel)
+        validLabel = np.array(validLabel)
+
+        model = Sequential()
+
+        model.add(Conv1D(64, kernel_size=3, dilation_rate=1, activation='relu', padding='causal', input_shape=(30,10)))
+        model.add(BatchNormalization())
+
+        model.add(Conv1D(64, kernel_size=3, dilation_rate=2, activation='relu', padding='causal'))
+        model.add(BatchNormalization())
+
+        model.add(Conv1D(64, kernel_size=3, dilation_rate=4, activation='relu', padding='causal'))
+        model.add(BatchNormalization())
+
+        model.add(Conv1D(64, kernel_size=3, dilation_rate=8, activation='relu', padding='causal'))
+        model.add(BatchNormalization())
+
+        model.add(GlobalAveragePooling1D())
+        model.add(Dense(13, activation='softmax'))
+
+        st = time.time()
+        model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+        print("TCN training....")
+        history = model.fit(trainData, trainLabel, validation_data=(validData, validLabel), epochs=100, batch_size=32)
+        print("TCN training complete")
+        trainTime = time.time() - st
+        st2 = time.time()
+        print("TCN classifying....")
+        probs = model.predict(testData)
+        print("TCN classifying complete")
+        classificationTime = time.time() - st2
+        classTimePerTest = classificationTime/ len(testLabel)
+        predictions = np.argmax(probs, axis=1)
+
+    elif algorithm == "DCNN":
+
+        trainData = np.array(trainData).reshape(-1, 30, 10, 1)
+        testData = np.array(testData).reshape(-1, 30, 10, 1)
+        validData = np.array(validData).reshape(-1, 30, 10, 1)
+
+        trainLabel = np.array(trainLabel)
+        testLabel = np.array(testLabel)
+        validLabel = np.array(validLabel)
+
+
+        model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+
+        st = time.time()
+        model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+        print("DCNN training....")
+        history = model.fit(trainData, trainLabel, validation_data=(validData, validLabel), epochs=100, batch_size=32)
+        print("DCNN training complete")
+        trainTime = time.time() - st
+        st2 = time.time()
+        print("DCNN classifying....")
+        probs = model.predict(testData)
+        print("DCNN classifying complete")
+        classificationTime = time.time() - st2
+        classTimePerTest = classificationTime/ len(testLabel)
+        predictions = np.argmax(probs, axis=1)
+
+    elif algorithm == "RF":
+
+        trainData = np.array([window.flatten() for window in trainData])
+        testData = np.array([window.flatten() for window in testData])
+        trainLabel = np.array(trainLabel)
+        testLabel = np.array(testLabel)
+
+        st = time.time()
+        rf = RandomForestClassifier(n_estimators=200, random_state=10, criterion="entropy")
+        print('RF training....')
+        rf.fit(trainData, trainLabel)
+        print('RF training complete')
+        trainTime = time.time() - st
+        st2 = time.time()
+        print('RF classifying....')
+        predictions = rf.predict(testData)
+        print('RF classifying complete')
+        classificationTime = time.time() - st2
+        classTimePerTest = classificationTime / len(testLabel)
+
+    elif algorithm == "GRU":
+
+        trainData = np.array(trainData).reshape(-1, 30, 10, 1)
+        testData = np.array(testData).reshape(-1, 30, 10, 1)
+        validData = np.array(validData).reshape(-1, 30, 10, 1)
+
+        trainLabel = np.array(trainLabel)
+        testLabel = np.array(testLabel)
+        validLabel = np.array(validLabel)
+
+        model = Sequential()
+        model.add(GRU(32, input_shape=(30, 10), return_sequences=True, activation='tanh'))
+        model.add(BatchNormalization())
+        model.add(Dropout(0.15))
+
+        model.add(GRU(32, return_sequences=False, activation='tanh'))
+        model.add(BatchNormalization())
+        model.add(Dropout(0.15))
+
+        model.add(Dense(13, activation='softmax'))
+
+        st = time.time()
+        model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+        print("GRU training....")
+        history = model.fit(trainData, trainLabel, validation_data=(validData, validLabel), epochs=100, batch_size=32)
+        print("GRU training complete")
+        trainTime = time.time() - st
+        st2 = time.time()
+        print("GRU classifying....")
+        probs = model.predict(testData)
+        print("GRU classifying complete")
+        classificationTime = time.time() - st2
+        classTimePerTest = classificationTime/ len(testLabel)
+        predictions = np.argmax(probs, axis=1)
+
+    elif algorithm == "LSTM":
+
+        trainData = np.array(trainData).reshape(-1, 30, 10, 1)
+        testData = np.array(testData).reshape(-1, 30, 10, 1)
+        validData = np.array(validData).reshape(-1, 30, 10, 1)
+
+        trainLabel = np.array(trainLabel)
+        testLabel = np.array(testLabel)
+        validLabel = np.array(validLabel)
+
+        trainData = tf.convert_to_tensor(trainData, dtype=tf.float32)
+        trainData = tf.reshape(trainData, [-1, 30, 10])
+        testData = tf.convert_to_tensor(testData, dtype=tf.float32)
+        testData = tf.reshape(testData, [-1, 30, 10])
+        validData = tf.convert_to_tensor(validData, dtype=tf.float32)
+        validData = tf.reshape(validData, [-1, 30, 10])
+
+        model = Sequential()
+        model.add(LSTM(256, input_shape=(30, 10), return_sequences=False))
+        model.add(BatchNormalization())
+        model.add(Dense(13, activation='softmax'))
+
+        st = time.time()
+        model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+        print("LSTM training....")
+        history = model.fit(trainData, trainLabel, validation_data=(validData, validLabel), epochs=100, batch_size=32)
+        print("LSTM training complete")
+        trainTime = time.time() - st
+        st2 = time.time()
+        print("LSTM classifying....")
+        probs = model.predict(testData)
+        print("LSTM classifying complete")
+        classificationTime = time.time() - st2
+        classTimePerTest = classificationTime/ len(testLabel)
+        predictions = np.argmax(probs, axis=1)
+
+    accuracy = np.sum(predictions == testLabel) / len(testLabel)
+    numClasses = len(np.unique(testLabel))
+    confusionMat = np.zeros((numClasses, numClasses))
+    for i in range(len(predictions)):
+        confusionMat[predictions[i]][testLabel[i]] += 1
+
+    # Group-wise performance metrics
+    group_metrics = {}
+    groupData = np.array([arr[0] for arr in groupData])
+    for group_num in np.unique(groupData):
+        group_indices = np.where(groupData == group_num)[0]
+        group_accuracy = np.sum(predictions[group_indices] == testLabel[group_indices]) / len(group_indices)
+        group_confusionMat = np.zeros((numClasses, numClasses))
+        for idx in group_indices:
+            group_confusionMat[predictions[idx]][testLabel[idx]] += 1
+        group_metrics[group_num] = {'Accuracy': group_accuracy, 'Confusion Matrix': group_confusionMat.tolist()}
+
+    # Save results to CSV
+    fileName = f"{algorithm}_performanceMetrics.csv"
+    with open(fileName, mode='w', newline='') as csvfile:
+        colNames = ['Algorithm', 'Accuracy', 'Train Time', 'Classification Time', 'Class Time Per Test', 'Confusion Matrix']
+        writer = csv.DictWriter(csvfile, fieldnames=colNames)
+        writer.writeheader()
+        writer.writerow({
+            'Algorithm': algorithm,
+            'Accuracy': accuracy,
+            'Train Time': trainTime,
+            'Classification Time': classificationTime,
+            'Class Time Per Test': classTimePerTest,
+            'Confusion Matrix': confusionMat.tolist()
+        })
+
+        # Write group-wise performance metrics
+        for group_num, metrics in group_metrics.items():
+            writer.writerow({
+                'Algorithm': algorithm + f' (Group {group_num})',
+                'Accuracy': metrics['Accuracy'],
+                'Confusion Matrix': metrics['Confusion Matrix']
+            })
+
+    # Saving history for deep learning models
+    if algorithm in ["CNN", "RNN", "TCN", "DCNN", "GRU", "LSTM"]:
+        history_dict = history.history
+        history_dict['Algorithm'] = algorithm
+        history_df = pd.DataFrame(history_dict)
+        history_df.to_csv(f"{algorithm}_history.csv", index=False)
+
+    print(f"Results saved to {fileName}")
