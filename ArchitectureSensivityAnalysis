@@ -1,0 +1,201 @@
+import csv
+import pandas as pd
+import pickle
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, BatchNormalization, Dense, Dropout
+import time
+
+# File paths for data and labels
+trainDataFile = 'finalTrainDataAugOvernight1.pkl'
+trainLabelFile = 'finalTrainLabelsAugOvernight1.pkl'
+testDataFile = 'finalTestData20cross.pkl'
+testLabelFile = 'finalTestLabels20cross.pkl'
+validDataFile = 'finalValidData20cross.pkl'
+validLabelFile = 'finalValidLabels20cross.pkl'
+testSubjIDFile = 'testSubjID20cross.pkl'
+
+# Load data and labels from files
+with open(trainDataFile, 'rb') as f:
+     finalTrainData = pickle.load(f)
+with open(trainLabelFile, 'rb') as f:
+     finalTrainLabels = pickle.load(f)
+with open(testDataFile, 'rb') as f:
+     finalTestData = pickle.load(f)
+with open(testLabelFile, 'rb') as f:
+     finalTestLabels = pickle.load(f)
+with open(testSubjIDFile, 'rb') as f:
+     testSubjID = pickle.load(f)
+with open(validDataFile, 'rb') as f:
+     finalValidData = pickle.load(f)
+with open(validLabelFile, 'rb') as f:
+     finalValidLabels = pickle.load(f)
+
+def lstmTestBench(trainData, trainLabel, testData, testLabel, validData, validLabel, groupData,
+                  lstmUnitsList, lstmLayersList, dropoutList, activationList):
+    """
+    Evaluate LSTM model with different configurations.
+
+    Parameters:
+    - trainData (numpy.ndarray): Training data.
+    - trainLabel (numpy.ndarray): Training labels.
+    - testData (numpy.ndarray): Test data.
+    - testLabel (numpy.ndarray): Test labels.
+    - validData (numpy.ndarray): Validation data.
+    - validLabel (numpy.ndarray): Validation labels.
+    - groupData (list): Group data.
+    - lstmUnitsList (list): List of LSTM units to test.
+    - lstmLayersList (list): List of LSTM layers to test.
+    - dropoutList (list): List of dropout rates to test.
+    - activationList (list): List of activation functions to test.
+    """
+
+    # Reshape data for LSTM input
+    trainData = np.array(trainData).reshape(-1, 30, 10, 1)
+    testData = np.array(testData).reshape(-1, 30, 10, 1)
+    validData = np.array(validData).reshape(-1, 30, 10, 1)
+
+    trainLabel = np.array(trainLabel)
+    testLabel = np.array(testLabel)
+    validLabel = np.array(validLabel)
+
+    trainData = tf.convert_to_tensor(trainData, dtype=tf.float32)
+    trainData = tf.reshape(trainData, [-1, 30, 10])
+    testData = tf.convert_to_tensor(testData, dtype=tf.float32)
+    testData = tf.reshape(testData, [-1, 30, 10])
+    validData = tf.convert_to_tensor(validData, dtype=tf.float32)
+    validData = tf.reshape(validData, [-1, 30, 10])
+
+    # Variables to investigate
+    for lstmUnits in lstmUnitsList:
+        for lstmLayers in lstmLayersList:
+            for dropoutRate in dropoutList:
+                for activation in activationList:
+                    # Construct model
+                    model = Sequential()
+                    for layer in range(lstmLayers):
+                        if layer == lstmLayers - 1:
+                            model.add(LSTM(lstmUnits, input_shape=(30, 10), return_sequences=False, activation=activation))
+                        else:
+                            model.add(LSTM(lstmUnits, input_shape=(30, 10), return_sequences=True, activation=activation))
+                        model.add(BatchNormalization())
+                        model.add(Dropout(dropoutRate))
+                    model.add(Dense(13, activation='softmax'))
+
+                    st = time.time()
+                    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+                    print(f"LSTM training with units={lstmUnits}, layers={lstmLayers}, "
+                            f"dropout={dropoutRate}, activation={activation}....")
+
+                    history = model.fit(trainData, trainLabel,
+                                        validation_data=(validData, validLabel),
+                                        epochs=100, batch_size=32)
+                    print(f"LSTM training complete with units={lstmUnits}, layers={lstmLayers}, "
+                            f"dropout={dropoutRate}, activation={activation}")
+
+                    trainTime = time.time() - st
+                    st2 = time.time()
+                    print("LSTM classifying....")
+                    probs = model.predict(testData)
+                    print("LSTM classifying complete")
+                    classificationTime = time.time() - st2
+                    classTimePerTest = classificationTime / len(testLabel)
+                    predictions = np.argmax(probs, axis=1)
+
+                    # Save misclassified windows to CSV
+                    misclassifiedData = []
+                    for i in range(len(predictions)):
+                        if predictions[i] != testLabel[i]:
+                            misclassifiedData.append({
+                                'WindowNumber': i,
+                                'TrueLabel': testLabel[i],
+                                'PredictedLabel': predictions[i],
+                                'Data': testData[i].numpy().tolist()
+                            })
+
+                    misfileName = f"final_LSTM_units{lstmUnits}_layers{lstmLayers}_dropout{dropoutRate}_activation{activation}_misclassifiedWindows.csv"
+                    with open(misfileName, mode='w', newline='') as misfile:
+                        miscolNames = ['WindowNumber', 'TrueLabel', 'PredictedLabel', 'Data']
+                        miswriter = csv.DictWriter(misfile, fieldnames=miscolNames)
+                        miswriter.writeheader()
+                        for row in misclassifiedData:
+                            miswriter.writerow(row)
+
+                    accuracy = np.sum(predictions == testLabel) / len(testLabel)
+                    numClasses = len(np.unique(testLabel))
+                    confusionMat = np.zeros((numClasses, numClasses))
+                    for i in range(len(predictions)):
+                        confusionMat[predictions[i]][testLabel[i]] += 1
+
+                    # Group-wise performance metrics
+                    groupMetrics = {}
+                    groupDataArr = np.array([arr[0] for arr in groupData])
+                    for groupNum in np.unique(groupDataArr):
+                        groupIndices = np.where(groupDataArr == groupNum)[0]
+                        groupAccuracy = np.sum(predictions[groupIndices] == testLabel[groupIndices]) / len(groupIndices)
+                        groupConfusionMat = np.zeros((numClasses, numClasses))
+                        for idx in groupIndices:
+                            groupConfusionMat[predictions[idx]][testLabel[idx]] += 1
+                        groupMetrics[groupNum] = {'Accuracy': groupAccuracy, 'ConfusionMatrix': groupConfusionMat.tolist()}
+
+                    # Save results to CSV
+                    fileName = f"final_LSTM_units{lstmUnits}_layers{lstmLayers}_dropout{dropoutRate}_activation{activation}_performanceMetrics.csv"
+                    with open(fileName, mode='w', newline='') as csvfile:
+                        colNames = ['Algorithm', 'Accuracy', 'TrainTime', 'ClassificationTime',
+                                    'ClassTimePerTest', 'ConfusionMatrix']
+                        writer = csv.DictWriter(csvfile, fieldnames=colNames)
+                        writer.writeheader()
+                        writer.writerow({
+                            'Algorithm': "LSTM",
+                            'Accuracy': accuracy,
+                            'TrainTime': trainTime,
+                            'ClassificationTime': classificationTime,
+                            'ClassTimePerTest': classTimePerTest,
+                            'ConfusionMatrix': confusionMat.tolist()
+                        })
+
+                        # Write group-wise performance metrics
+                        for groupNum, metrics in groupMetrics.items():
+                            writer.writerow({
+                                'Algorithm': f"LSTM (Group {groupNum})",
+                                'Accuracy': metrics['Accuracy'],
+                                'ConfusionMatrix': metrics['ConfusionMatrix']
+                            })
+
+                    historyDict = history.history
+                    historyDict['Algorithm'] = "LSTM"
+                    historyDict['Units'] = lstmUnits
+                    historyDict['Layers'] = lstmLayers
+                    historyDict['Dropout'] = dropoutRate
+                    historyDict['Activation'] = activation
+                    historyDf = pd.DataFrame(historyDict)
+                    historyDf.to_csv(f"final_LSTM_units{lstmUnits}_layers{lstmLayers}_dropout{dropoutRate}_activation{activation}_history.csv", index=False)
+
+# Example uses for parameters tested in report
+# Run tests for number of units
+lstmUnitsList = [32, 64, 128, 256, 512]
+lstmLayersList = [2]
+dropoutList = [0]
+activationList = ['tanh']
+
+lstmTestBench(finalTrainData, finalTrainLabels, finalTestData, finalTestLabels, finalValidData, finalValidLabels, testSubjID,
+                lstmUnitsList, lstmLayersList, dropoutList, activationList)
+
+# Run tests for number of layers
+lstmUnitsList = [256]
+lstmLayersList = [1, 2, 3, 4, 5]
+dropoutList = [0]
+activationList = ['tanh']
+
+lstmTestBench(finalTrainData, finalTrainLabels, finalTestData, finalTestLabels, finalValidData, finalValidLabels, testSubjID,
+                lstmUnitsList, lstmLayersList, dropoutList, activationList)
+
+# Run tests for dropout
+lstmUnitsList = [256]
+lstmLayersList = [1]
+dropoutList = [0, 0.2, 0.4, 0.6, 0.8]
+activationList = ['tanh']
+
+lstmTestBench(finalTrainData, finalTrainLabels, finalTestData, finalTestLabels, finalValidData, finalValidLabels, testSubjID,
+                lstmUnitsList, lstmLayersList, dropoutList, activationList)
