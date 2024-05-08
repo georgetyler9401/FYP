@@ -1,0 +1,245 @@
+import numpy as np
+import pickle
+import pandas as pd
+import csv
+import tensorflow.keras as keras
+from tensorflow.keras.models import Sequential, Model
+from tensorflow.keras.layers import Dense, LayerNormalization, Conv2D, DepthwiseConv2D, Input, Add, GlobalAveragePooling2D, Dropout
+from tensorflow.keras.regularizers import l1_l2
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow_addons.layers import StochasticDepth
+
+
+# Example file paths for data and labels
+trainDataFile = 'finalTrainDataAugOvernight1.pkl'
+trainLabelFile = 'finalTrainLabelsAugOvernight1.pkl'
+testDataFile = 'finalTestData20cross.pkl'
+testLabelFile = 'finalTestLabels20cross.pkl'
+validDataFile = 'finalValidData20cross.pkl'
+validLabelFile = 'finalValidLabels20cross.pkl'
+testSubjIDFile = 'testSubjID20cross.pkl'
+
+# Load data and labels from files
+with open(trainDataFile, 'rb') as f:
+     finalTrainData = pickle.load(f)
+with open(trainLabelFile, 'rb') as f:
+     finalTrainLabels = pickle.load(f)
+with open(testDataFile, 'rb') as f:
+     finalTestData = pickle.load(f)
+with open(testLabelFile, 'rb') as f:
+     finalTestLabels = pickle.load(f)
+with open(testSubjIDFile, 'rb') as f:
+     testSubjID = pickle.load(f)
+with open(validDataFile, 'rb') as f:
+     finalValidData = pickle.load(f)
+with open(validLabelFile, 'rb') as f:
+     finalValidLabels = pickle.load(f)
+
+# Convert window data and labels to array
+finalTrainData = np.array(finalTrainData).reshape(-1, 30, 10, 1)
+finalValidData = np.array(finalValidData).reshape(-1, 30, 10, 1)
+finalTestData = np.array(finalTestData).reshape(-1, 30, 10, 1)
+
+
+# Convert labels to array
+finalTrainLabels = np.array(finalTrainLabels)
+finalValidLabels = np.array(finalValidLabels)
+finalTestLabels = np.array(finalTestLabels)
+
+
+def convNeXtBlock(width, kernelSize, inputShape):
+    """
+    Create a ConvNeXt block.
+
+    Parameters:
+    - width (int): Width of the ConvNeXt block.
+    - kernelSize (int): Kernel size for convolution operations.
+    - inputShape (tuple): Shape of the input tensor.
+
+    Returns:
+    - model (tensorflow.keras.Model): ConvNeXt block model.
+    """
+    # Define input layer
+    inputs = Input(shape=inputShape)
+
+    # Depthwise convolution
+    conv1 = DepthwiseConv2D(kernel_size=kernelSize, padding='same', l1_l2=l1_l2(1e-5, 1e-5))
+    x = conv1(inputs)
+
+    # Layer normalization
+    LN = LayerNormalization()
+    x = LN(x)
+
+    # Pointwise convolutions
+    conv2 = Conv2D(4*width, kernel_size=1, padding='same', activation='gelu', kernel_regularizer=l1_l2(1e-5, 1e-5))
+    x = conv2(x)
+    conv3 = Conv2D(width, kernel_size=1, padding='same', activation='gelu', kernel_regularizer=l1_l2(1e-5, 1e-5))
+    x = conv3(x)
+
+    # Residual connection
+    resConv = Conv2D(width, kernel_size=1, padding='same')
+    residual = resConv(inputs)
+    x = StochasticDepth(survival_probability=0.9)([x, residual])
+
+    # Define model
+    model = Model(inputs=inputs, outputs=x)
+
+    return model
+
+
+# Create a sequential model
+model = Sequential()
+
+# Add ConvNeXt blocks with increasing width and depth
+model.add(convNeXtBlock(16, (5, 5), (30, 10, 1)))
+
+model.add(convNeXtBlock(32, (5, 5), (30, 10, 16)))
+
+model.add(convNeXtBlock(64, (5, 5), (30, 10, 32)))
+model.add(convNeXtBlock(64, (5, 5), (30, 10, 64)))
+model.add(convNeXtBlock(64, (5, 5), (30, 10, 64)))
+
+model.add(convNeXtBlock(128, (5, 5), (30, 10, 64)))
+
+# Global average pooling layer
+model.add(GlobalAveragePooling2D())
+
+# Output layer with softmax activation
+model.add(Dense(13, activation='softmax'))
+
+# Print model summary
+model.summary()
+
+
+
+# Define optimiser with AdamW
+opt = keras.optimizers.AdamW(learning_rate=0.0001, weight_decay=1e-5)
+
+# Compile the model
+model.compile(optimizer=opt, loss='sparse_categorical_crossentropy', metrics=['accuracy'], batch_size=64)
+
+# Define early stopping callback
+ES = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=10)
+
+# Train the model
+history = model.fit(finalTrainData, finalTrainLabels, epochs=100, validation_data=(finalValidData, finalValidLabels), callbacks=[ES])
+
+# Make predictions on test data
+probs = model.predict(finalTestData)
+preds = np.argmax(probs, axis=1)
+
+# Calculate accuracy
+acc = np.sum(preds == finalTestLabels) / len(finalTestLabels)
+
+
+# Save training history to a CSV file
+historyDict = history.history
+historyDict['Accuracy'] = acc
+historyDF = pd.DataFrame(historyDict)
+historyDF.to_csv("final_model_history.csv", index=False)
+
+# Save misclassified windows to a CSV file
+missclassData = []
+for i in range(len(preds)):
+    if preds[i] != finalTestLabels[i]:
+        missclassData.append({'windNum': i, 'trueLabel': finalTestLabels[i], 'predLabel': preds[i], 'Data': finalTestData[i].tolist()})
+
+with open('final_model_missclassWinds.csv', mode='w', newline='') as misfile:
+    miscolNames = ['windNum', 'trueLabel', 'predLabel', 'Data']
+    miswrite = csv.DictWriter(misfile, fieldnames=miscolNames)
+    miswrite.writeheader()
+    for row in missclassData:
+        miswrite.writerow(row)
+
+# Calculate confusion matrix
+numClasses = len(np.unique(finalTestLabels))
+conMat = np.zeros((numClasses, numClasses))
+for i in range(len(preds)):
+    conMat[preds[i]][finalTestLabels[i]] += 1
+
+# Calculate group-wise performance metrics
+groupMets = {}
+groupDataArray = np.array([arr[0] for arr in testSubjID])
+for groupNum in np.unique(groupDataArray):
+    grpInd = np.where(groupDataArray == groupNum)[0]
+    grpAcc = np.sum(preds[grpInd] == finalTestLabels[grpInd]) / len(grpInd)
+    grpConf = np.zeros((numClasses, numClasses))
+    for idx in grpInd:
+        grpConf[preds[idx]][finalTestLabels[idx]] += 1
+    groupMets[groupNum] = {'Accuracy': grpAcc, 'ConfusionMatrix': grpConf.tolist()}
+
+# Save performance metrics to CSV
+fileName = 'final_model_performance_metrics.csv'
+with open(fileName, mode='w', newline='') as csvfile:
+    colNames = ['Accuracy', 'ConfusionMatrix']
+    writer = csv.DictWriter(csvfile, fieldnames=colNames)
+    writer.writeheader()
+    writer.writerow({'Accuracy': acc, 'ConfusionMatrix': conMat.tolist()})
+
+    for groupNum, metrics in groupMets.items():
+        writer.writerow({
+            'Accuracy': metrics['Accuracy'],
+            'ConfusionMatrix': metrics['ConfusionMatrix']
+        })
+
+# example of how to run on 10 test iterations and save results
+# for i in range(10):
+#     # Train the model
+#     history = model.fit(finalTrainData, finalTrainLabels, epochs=100, validation_data=(finalValidData, finalValidLabels), callbacks=[ES])
+        
+#     # Make predictions on test data
+#     probs = model.predict(finalTestData)
+#     preds = np.argmax(probs, axis=1)
+        
+#     # Calculate accuracy
+#     acc = np.sum(preds == finalTestLabels) / len(finalTestLabels)
+        
+#     # Save training history to a CSV file
+#     historyDict = history.history
+#     historyDict['Accuracy'] = acc
+#     historyDF = pd.DataFrame(historyDict)
+#     historyDF.to_csv(f"final_model_history_{i}.csv", index=False)
+        
+#     # Save misclassified windows to a CSV file
+#     missclassData = []
+#     for i in range(len(preds)):
+#         if preds[i] != finalTestLabels[i]:
+#             missclassData.append({'windNum': i, 'trueLabel': finalTestLabels[i], 'predLabel': preds[i], 'Data': finalTestData[i].tolist()})
+        
+#     with open(f'final_model_missclassWinds_{i}.csv', mode='a', newline='') as misfile:
+#         miscolNames = ['windNum', 'trueLabel', 'predLabel', 'Data']
+#         miswrite = csv.DictWriter(misfile, fieldnames=miscolNames)
+#         for row in missclassData:
+#             miswrite.writerow(row)
+        
+#     # Calculate confusion matrix
+#     numClasses = len(np.unique(finalTestLabels))
+#     conMat = np.zeros((numClasses, numClasses))
+#     for i in range(len(preds)):
+#         conMat[preds[i]][finalTestLabels[i]] += 1
+        
+#     # Calculate group-wise performance metrics
+#     groupMets = {}
+#     groupDataArray = np.array([arr[0] for arr in testSubjID])
+#     for groupNum in np.unique(groupDataArray):
+#         grpInd = np.where(groupDataArray == groupNum)[0]
+#         grpAcc = np.sum(preds[grpInd] == finalTestLabels[grpInd]) / len(grpInd)
+#         grpConf = np.zeros((numClasses, numClasses))
+#         for idx in grpInd:
+#             grpConf[preds[idx]][finalTestLabels[idx]] += 1
+#         groupMets[groupNum] = {'Accuracy': grpAcc, 'ConfusionMatrix': grpConf.tolist()}
+        
+#     # Save performance metrics to CSV
+#     fileName = f'final_model_performance_metrics_{i}.csv'
+#     with open(fileName, mode='a', newline='') as csvfile:
+#         colNames = ['Accuracy', 'ConfusionMatrix']
+#         writer = csv.DictWriter(csvfile, fieldnames=colNames)
+#         writer.writeheader()
+#         writer.writerow({'Accuracy': acc, 'ConfusionMatrix': conMat.tolist()})
+        
+#         for groupNum, metrics in groupMets.items():
+#             writer.writerow({
+#                 'Accuracy': metrics['Accuracy'],
+#                 'ConfusionMatrix': metrics['ConfusionMatrix']
+#             })
+        
